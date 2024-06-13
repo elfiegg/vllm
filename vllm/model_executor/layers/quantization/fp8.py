@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import cudnn
+import torch.cuda.nvtx as nvtx
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -9,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.layers.utils.cudnn_util import build_fp8_matmul_bias_graph, execute_graph, cudnn_reshape_to_3d, build_fp8_matmul_bias_silu_graph
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils import print_warning_once
 
@@ -251,12 +254,13 @@ class Fp8LinearMethod(LinearMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
+              bias: Optional[torch.Tensor] = None,
+              fuse_silu=False) -> torch.Tensor:
         # ops.scaled_fp8_quant supports both dynamic and static quant.
         #   If dynamic, layer.input_scale is None and x_scale computed from x.
         #   If static, layer.input_scale is scalar and x_scale is input_scale.
-
+        graph_key = (layer.weight.shape, x.shape)
+        nvtx.range_push(str(graph_key))
         if bias is None and self.cutlass_fp8_supported:
             qinput, x_scale = ops.scaled_fp8_quant(x, layer.input_scale)
 
@@ -286,7 +290,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_b=layer.weight_scale,
                 bias=bias,
             )
-
+        nvtx.range_pop()
         return torch.narrow(output, 0, 0, x.shape[0])
 
 
@@ -326,6 +330,130 @@ class Fp8KVCacheMethod(QuantizeMethodBase):
                     "cause accuracy issues. Please make sure kv-cache scaling "
                     "factor is available in the fp8 checkpoint.")
         del layer.kv_scale
+
+
+class CudnnFp8Config(Fp8Config):
+
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+    ) -> None:
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        if is_checkpoint_fp8_serialized:
+            logger.warning("Detected fp8 checkpoint. Please note that the "
+                           "format is experimental and subject to change.")
+        if activation_scheme not in ACTIVATION_SCHEMES:
+            raise ValueError(
+                f"Unsupported activation scheme {activation_scheme}")
+        self.activation_scheme = activation_scheme
+        self.cudnn_graphs = {}
+        self.cudnn_handle = cudnn.create_handle()
+    
+    @classmethod
+    def get_name(cls) -> str:
+        return "cudnn-fp8"
+        
+    def get_quant_method(
+            self, layer: torch.nn.Module) -> Optional["QuantizeMethodBase"]:
+        from vllm.attention.layer import Attention  # Avoid circular import
+
+        if isinstance(layer, LinearBase):
+            return CudnnFp8LinearMethod(self)
+        if isinstance(layer, Attention):
+            return Fp8KVCacheMethod(self)
+        return None
+
+
+class CudnnFp8LinearMethod(Fp8LinearMethod):
+    """Linear method for FP8 with cuDNN fusion support."""
+
+    def __init__(self, quant_config: CudnnFp8Config):
+        self.quant_config = quant_config
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              bias: Optional[torch.Tensor] = None,
+              fuse_silu: bool = False,
+              fp8_out_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if x.dtype is not torch.float8_e4m3fn :
+            # or self.quant_config.activation_scheme != 'static':
+            qinput, x_scale = ops.scaled_fp8_quant(x, layer.input_scale)
+        else:
+            qinput = x
+            x_scale = torch.empty(
+                1, device=x.device, dtype=torch.float
+            ) if layer.input_scale is None else layer.input_scale
+        if not fuse_silu:
+            # Fused GEMM_DQ
+            output = ops.cutlass_scaled_mm_dq(
+                qinput,
+                layer.weight,
+                out_dtype=torch.float16,
+                scale_a=x_scale,
+                scale_b=layer.weight_scale,
+            )
+            return torch.narrow(output, 0, 0, x.shape[0])
+        else:
+            output_shape = (x.shape[0], layer.weight.shape[1] // 2)
+            # dtype = torch.float8_e4m3fn if fp8_out_scale is not None else x.dtype
+            dtype = torch.float8_e4m3fn
+            output = torch.empty((1, ) + output_shape,
+                                 device=x.device,
+                                 dtype=dtype)
+            d = layer.weight.shape[1] // 2
+            weight_up = layer.weight[:, :d]
+            weight_down = layer.weight[:, d:]
+
+            nvtx.range_push('scalar multiplication')
+            dq_scale = x_scale * layer.weight_scale
+            nvtx.range_pop()
+
+            graph_key = (layer.weight.shape, x.shape, fuse_silu)
+            nvtx.range_push(str(graph_key))
+
+            nvtx.range_push("fp8 out scale")
+            fp8_out_scale = torch.empty(1,
+                                        device=x.device,
+                                        dtype=x_scale.dtype)
+            nvtx.range_pop()
+
+            nvtx.range_push('graph caching')
+            if graph_key not in self.quant_config.cudnn_graphs:
+                results = build_fp8_matmul_bias_silu_graph(
+                    qinput, weight_up, weight_down, dq_scale, bias,
+                    fp8_out_scale)
+                self.quant_config.cudnn_graphs[graph_key] = results
+            else:
+                results = self.quant_config.cudnn_graphs[graph_key]
+            nvtx.range_pop()
+
+            nvtx.range_push('variant pack')
+            variant_pack = {
+                results['act']:
+                qinput.data_ptr(),
+                results['bias']:
+                bias.data_ptr() if bias is not None else None,
+                results['weight_up']:
+                weight_up.data_ptr(),
+                results['weight_down']:
+                weight_down.data_ptr(),
+                results['dq_scale']:
+                dq_scale.data_ptr(),
+                results['out_scale']:
+                fp8_out_scale.data_ptr()
+                if fp8_out_scale is not None else None,
+                results['output']:
+                output.data_ptr(),
+            }
+            nvtx.range_pop()
+
+            nvtx.range_push('execute graph')
+            execute_graph(results['graph'], variant_pack)
+            nvtx.range_pop()
+            nvtx.range_pop()
+            return output.reshape(output_shape).narrow(0, 0, x.shape[0])
 
 
 def all_close_1d(x: torch.Tensor) -> bool:

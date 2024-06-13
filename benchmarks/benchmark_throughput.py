@@ -12,7 +12,6 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 
-
 def sample_requests(
     dataset_path: str,
     num_requests: int,

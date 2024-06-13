@@ -26,13 +26,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 from transformers import LlamaConfig
+import torch.cuda.nvtx as nvtx
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import RMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
@@ -48,7 +49,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_hip, print_warning_once
-
+from vllm.model_executor.layers.quantization.fp8 import CudnnFp8Config
 
 class LlamaMLP(nn.Module):
 
@@ -61,11 +62,13 @@ class LlamaMLP(nn.Module):
         bias: bool = False,
     ) -> None:
         super().__init__()
+        self.fuse_silu = isinstance(quant_config, CudnnFp8Config)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
             bias=bias,
-            quant_config=quant_config)
+            quant_config=quant_config, 
+            fuse_silu=self.fuse_silu)
         self.down_proj = RowParallelLinear(input_size=intermediate_size,
                                            output_size=hidden_size,
                                            bias=bias,
@@ -76,8 +79,11 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.fuse_silu:
+            x, _ = self.gate_up_proj(x, self.down_proj.input_scale)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -218,23 +224,31 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        nvtx.range_push("input layernorm")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        nvtx.range_pop()
+        nvtx.range_push("attention")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
+        nvtx.range_pop()
 
         # Fully Connected
+        nvtx.range_push("post attention layernorm")
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        nvtx.range_pop()
+        nvtx.range_push("mlp")
         hidden_states = self.mlp(hidden_states)
+        nvtx.range_pop()
         return hidden_states, residual
 
 
@@ -292,7 +306,9 @@ class LlamaModel(nn.Module):
                 attn_metadata,
                 residual,
             )
+        nvtx.range_push("norm")
         hidden_states, _ = self.norm(hidden_states, residual)
+        nvtx.range_pop()
         return hidden_states
 
 

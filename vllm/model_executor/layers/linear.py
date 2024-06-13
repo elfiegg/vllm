@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
 from torch.nn.parameter import Parameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
@@ -69,7 +70,9 @@ class LinearMethodBase(QuantizeMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+              bias: Optional[torch.Tensor] = None,
+              fuse_silu: bool = False,
+              fp8_out_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
@@ -229,11 +232,13 @@ class ColumnParallelLinear(LinearBase):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 output_sizes: Optional[List[int]] = None):
+                 output_sizes: Optional[List[int]] = None,
+                 fuse_silu: bool = False):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config)
 
         self.gather_output = gather_output
+        self.fuse_silu = fuse_silu
 
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size()
@@ -290,18 +295,25 @@ class ColumnParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, fp8_out_scale=None):
+        nvtx.range_push("gate up proj start")
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
+        nvtx.range_push("matmul")
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self.quant_method.apply(
+            self, input_, bias, self.fuse_silu
+        ) if fp8_out_scale is None else self.quant_method.apply(
+            self, input_, bias, self.fuse_silu, fp8_out_scale)
+        nvtx.range_pop()
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
+        nvtx.range_pop()
         return output, output_bias
 
     def extra_repr(self) -> str:
@@ -341,7 +353,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                  gather_output: bool = False,
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 fuse_silu: bool = False):
         self.output_sizes = output_sizes
         tp_size = get_tensor_model_parallel_world_size()
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
@@ -351,7 +364,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          gather_output=gather_output,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         fuse_silu=fuse_silu)
 
     def weight_loader(self,
                       param: Parameter,
@@ -543,7 +557,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                          gather_output=False,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         fuse_silu=False)
 
     def weight_loader(self,
                       param: Parameter,
@@ -791,6 +806,7 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, input_):
         # Set up backprop all-reduce.
+        nvtx.range_push("down proj start")
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -800,12 +816,14 @@ class RowParallelLinear(LinearBase):
             input_parallel = splitted_input[tp_rank].contiguous()
 
         # Matrix multiply.
+        nvtx.range_push("matmul")
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_parallel)
         if self.reduce_results and self.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output_ = output_parallel
+        nvtx.range_pop()
 
         if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
@@ -813,6 +831,7 @@ class RowParallelLinear(LinearBase):
         else:
             output = output_
             output_bias = self.bias
+        nvtx.range_pop()
         return output, output_bias
 
     def extra_repr(self) -> str:
