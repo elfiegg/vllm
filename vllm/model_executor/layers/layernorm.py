@@ -3,7 +3,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-
+import transformer_engine as te
+import transformer_engine_extensions as tex
+from transformer_engine.pytorch.cpp_extensions import (rmsnorm_fwd_fp8_inf,
+                                                       rmsnorm_fwd_inf)
 from vllm.model_executor.custom_op import CustomOp
 
 

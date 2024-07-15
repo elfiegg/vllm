@@ -21,11 +21,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
+import transformer_engine as te
+import transformer_engine_extensions as tex
+from transformer_engine.pytorch.cpp_extensions import (
+    swiglu, )
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
@@ -76,12 +81,35 @@ class LlamaMLP(nn.Module):
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+        # Creates TE SiluAndMul function which fuses output quantization 
+        # ops. This currently only works for static FP8 quantization.
+        # Otherwise falls back to vLLM's SiluAndMul function.
+        if quant_config.get_name(
+        ) == "fp8" and quant_config.activation_scheme == "static":
+            fp8_meta_tensor = tex.FP8TensorMeta()
+            fp8_meta_tensor.scale = self.down_proj.act_scale
+            fp8_meta_tensor.scale_inv = 1 / self.down_proj.act_scale
+            fp8_meta_tensor.amax_history = torch.empty([2, 1],
+                                                       dtype=torch.float32,
+                                                       device="cuda")
+            te_silu_and_mul_fn = partial(
+                swiglu,
+                fp8_meta_tensor=fp8_meta_tensor,
+                fp8_tensor=tex.FP8FwdTensors.GEMM1_INPUT,
+                otype=tex.DType.kFloat8E4M3)
 
-    def forward(self, x):
+            def te_silu_and_mul(x):
+                result = te_silu_and_mul_fn(x)
+                return result.view(torch.float8_e4m3fn)
+
+            self.act_fn = te_silu_and_mul
+        else:
+            self.act_fn = SiluAndMul()
+
+    def forward(self, x, prop_dtype):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, prop_dtype)
         return x
 
 
@@ -157,6 +185,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        prop_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -221,6 +250,7 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        prop_dtype = hidden_states.dtype
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -232,12 +262,13 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            prop_dtype=prop_dtype,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, prop_dtype)
         return hidden_states, residual
 
 
