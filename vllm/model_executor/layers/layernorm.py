@@ -3,7 +3,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-
+import transformer_engine as te
+import transformer_engine_extensions as tex
+from transformer_engine.pytorch.cpp_extensions import (rmsnorm_fwd_fp8_inf,
+                                                       rmsnorm_fwd_inf)
 from vllm.model_executor.custom_op import CustomOp
 
 
@@ -141,3 +144,52 @@ class GemmaRMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # TODO(woosuk): Implement an optimized kernel for GemmaRMSNorm.
         return self.forward_native(x, residual)
+
+
+class RMSNormFp8Output(RMSNorm):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        output_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__(hidden_size=hidden_size, eps=eps)
+        # Initialize FP8 meta tensor and other required objects
+        fp8_meta_tensor = tex.FP8TensorMeta()
+        self.fp8_meta_tensor = None
+        if output_scale is not None:
+            fp8_meta_tensor.scale = torch.tensor(output_scale,
+                                                 dtype=torch.float32,
+                                                 device="cuda")
+            # Dummy tensor due to the underlying API requirements.
+            fp8_meta_tensor.scale_inv = torch.tensor(output_scale,
+                                                     dtype=torch.float32,
+                                                     device="cuda")
+            # Dummy tensor due to the underlying API requirements.
+            fp8_meta_tensor.amax_history = torch.tensor([[0]],
+                                                        dtype=torch.float32,
+                                                        device="cuda")
+            self.fp8_meta_tensor = fp8_meta_tensor
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            x = x + residual
+        sm_margin = 0
+        if self.fp8_meta_tensor is not None:
+            fp8_tensor = tex.FP8FwdTensors.GEMM1_INPUT
+            otype = tex.DType.kFloat8E4M3
+            output = rmsnorm_fwd_fp8_inf(x, self.weight, self.variance_epsilon,
+                                         self.fp8_meta_tensor, fp8_tensor,
+                                         otype,
+                                         sm_margin).view(torch.float8_e4m3fn)
+        else:
+            output = rmsnorm_fwd_inf(x, self.weight, self.variance_epsilon,
+                                     sm_margin)
+        if residual is not None:
+            return output, residual
+        return output

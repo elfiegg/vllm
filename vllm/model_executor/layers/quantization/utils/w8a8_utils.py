@@ -83,8 +83,8 @@ def requantize_with_max_scale(
     # from disk in this case. Skip requantization in this case (since)
     # we already are quantized with the single scale.
     # * Sample Model: nm-testing/Phi-3-mini-128k-instruct-FP8
-    unfused_module_in_checkpoint = (weight_scale[-1] > torch.finfo(
-        torch.float8_e4m3fn).min)
+    unfused_module_in_checkpoint = (weight_scale[-1]
+                                    > torch.finfo(torch.float8_e4m3fn).min)
 
     # If unfused checkpoint, need requanize with the single scale.
     if unfused_module_in_checkpoint:
@@ -105,36 +105,43 @@ def apply_fp8_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
+    prop_dtype: Optional[torch.dtype] = None,
     bias: Optional[torch.Tensor] = None,
     cutlass_fp8_supported: bool = True,
 ) -> torch.Tensor:
+    # Uses input's dtype as dot's output dtype if prop_dtype is not specified.
+    if prop_dtype is None:
+        prop_dtype = input.dtype
+    # Skips quantization if the input has already been quantized.
+    if input.dtype is torch.float8_e4m3fn:
+        qinput, x_scale = input, input_scale
     # ops.scaled_fp8_quant supports both dynamic and static quant.
     #   If dynamic, layer.input_scale is None and x_scale computed from x.
     #   If static, layer.input_scale is scalar and x_scale is input_scale.
-
-    if cutlass_fp8_supported:
+    elif cutlass_fp8_supported:
         qinput, x_scale = ops.scaled_fp8_quant(input, input_scale)
-
-        # Fused GEMM_DQ
-        output = ops.cutlass_scaled_mm(qinput,
-                                       weight,
-                                       out_dtype=input.dtype,
-                                       scale_a=x_scale,
-                                       scale_b=weight_scale,
-                                       bias=bias)
-
     else:
         qinput, x_scale = ops.scaled_fp8_quant(input,
                                                input_scale,
                                                batch_dim_padding=17)
 
+    if cutlass_fp8_supported:
+        # Fused GEMM_DQ
+        output = ops.cutlass_scaled_mm(qinput,
+                                       weight,
+                                       out_dtype=prop_dtype,
+                                       scale_a=x_scale,
+                                       scale_b=weight_scale,
+                                       bias=bias)
+
+    else:
         # Fused GEMM_DQ -- note we padded the input above because
         # torch._scaled_mm is more performant for matrices with
         # batch dimension > 16. Note that this could change
         # in the future.
         output, _ = torch._scaled_mm(qinput,
                                      weight,
-                                     out_dtype=input.dtype,
+                                     out_dtype=prop_dtype,
                                      scale_a=x_scale,
                                      scale_b=weight_scale,
                                      bias=bias)

@@ -32,7 +32,7 @@ from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import RMSNorm, RMSNormFp8Output
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
@@ -78,8 +78,8 @@ class LlamaMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+    def forward(self, x, prop_dtype):
+        gate_up, _ = self.gate_up_proj(x, prop_dtype)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -157,8 +157,9 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        prop_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, prop_dtype)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
@@ -207,10 +208,21 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             bias=getattr(config, "mlp_bias", False),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+        if quant_config.get_name(
+        ) == "fp8" and quant_config.activation_scheme == "static":
+            self.input_layernorm = RMSNormFp8Output(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                output_scale=self.self_attn.qkv_proj.act_scale)
+            self.post_attention_layernorm = RMSNormFp8Output(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                output_scale=self.mlp.gate_up_proj.act_scale)
+        else:
+            self.input_layernorm = RMSNorm(config.hidden_size,
+                                           eps=config.rms_norm_eps)
+            self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                    eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -221,6 +233,7 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        prop_dtype = hidden_states.dtype
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -232,12 +245,13 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            prop_dtype=prop_dtype,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, prop_dtype)
         return hidden_states, residual
 
 

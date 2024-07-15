@@ -196,10 +196,10 @@ class ReplicatedLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, prop_dtype: torch.dtype) -> torch.Tensor:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        output = self.quant_method.apply(self, x, prop_dtype, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -297,12 +297,12 @@ class ColumnParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, prop_dtype:Optional[torch.dtype] = None):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self.quant_method.apply(self, input_, prop_dtype, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -730,7 +730,7 @@ class RowParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, prop_dtype:Optional[torch.dtype] = None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -741,7 +741,7 @@ class RowParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_parallel)
+        output_parallel = self.quant_method.apply(self, input_parallel, prop_dtype)
         if self.reduce_results and self.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:

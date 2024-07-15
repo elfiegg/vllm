@@ -184,7 +184,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
             if self.quant_config.activation_scheme == "static":
                 layer.input_scale = Parameter(layer.input_scale.max(),
-                                              requires_grad=False)
+                                            requires_grad=False)
             else:
                 layer.input_scale = None
 
@@ -196,6 +196,7 @@ class Fp8LinearMethod(LinearMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
+              prop_dtype: Optional[torch.dtype] = None,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         if self.use_marlin:
@@ -213,6 +214,7 @@ class Fp8LinearMethod(LinearMethodBase):
             weight=layer.weight,
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
+            prop_dtype=prop_dtype,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported)
 
@@ -343,7 +345,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if (not all_close_1d(layer.a13_scale)
                         or not all_close_1d(layer.a2_scale)):
                     print_warning_once(
-                        "Found input_scales that are not equal for "
+                        "Found act_scales that are not equal for "
                         "fp8 MoE layer. Using the maximum across experts "
                         "for each layer. ")
                 layer.a13_scale = torch.nn.Parameter(layer.a13_scale.max(),
