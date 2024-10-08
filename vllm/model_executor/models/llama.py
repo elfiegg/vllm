@@ -455,6 +455,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        print("hidden states:", hidden_states.shape)
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits

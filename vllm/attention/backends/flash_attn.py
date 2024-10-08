@@ -658,6 +658,7 @@ def unified_flash_attention(
                 f"key : {key.shape} : #prefill tokens {num_prefill_tokens} : #decode tokens {num_decode_tokens}" # noqa
     assert value.shape[0] == num_prefill_tokens + num_decode_tokens, \
                 f"value : {value.shape} : #prefill toks {num_prefill_tokens} : #decode toks {num_decode_tokens}" # noqa
+    print(f"key : {key.shape} : value : {value.shape} : #prefill tokens {num_prefill_tokens} : #decode tokens {num_decode_tokens}")
 
     # Query for decode. KV is not needed because it is already cached.
     decode_query = query[num_prefill_tokens:]
@@ -697,6 +698,8 @@ def unified_flash_attention(
             # prefix-enabled attention
             assert prefill_meta.seq_lens is not None
             max_seq_len = max(prefill_meta.seq_lens)
+            print("prefill query: ", query.shape)
+            print("prefill kv_cache: ", kv_cache.shape)
             prefill_output = flash_attn_varlen_func(  # noqa
                 q=query,
                 k=key_cache,
@@ -717,6 +720,8 @@ def unified_flash_attention(
         _, num_head, head_dim = decode_query.shape
         decode_query = decode_query.reshape(-1, decode_meta.decode_query_len,
                                             num_head, head_dim)
+        print("decode_query: ", decode_query.shape)
+        print("decode kv_cache: ", kv_cache.shape)
         decode_output = flash_attn_with_kvcache(
             q=decode_query,
             k_cache=key_cache,
@@ -728,6 +733,7 @@ def unified_flash_attention(
             alibi_slopes=alibi_slopes,
             softcap=logits_soft_cap,
         ).squeeze(1)
+
 
     if prefill_output is None:
         assert decode_output is not None

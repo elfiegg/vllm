@@ -1,0 +1,28 @@
+# Use the base image created from the existing Dockerfile
+ARG VERSION=master-py3-devel
+FROM gitlab-master.nvidia.com:5005/dl/dgx/tensorflow:${VERSION}
+
+RUN apt-get update && apt-get install -y tmux cmake
+
+ENV HUGGING_FACE_HUB_TOKEN=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
+ENV CCACHE_DIR=./ccache
+
+# Map host user into the container
+ARG UID
+ARG GID
+ARG UNAME
+RUN getent group ${GID} || addgroup --gid ${GID} ${UNAME} && \
+    adduser --uid ${UID} --gid ${GID} --disabled-password --gecos "" ${UNAME}
+
+# Create a directory for CMake cache
+RUN apt-get update && apt-get install -y ccache
+
+# Skip printing banners
+RUN cat /dev/null > /opt/nvidia/entrypoint.d/30-container-licecdcds990nse.txt
+RUN cat /dev/null > /opt/nvidia/entrypoint.d/15-container-copyright.txt
+
+# Set the default user to non-root
+USER ${UNAME}
+
+# Set the default command to bash
+CMD bash
