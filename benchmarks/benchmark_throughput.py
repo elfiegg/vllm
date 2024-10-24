@@ -314,7 +314,7 @@ def run_mii(
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
-
+    time.sleep(60)
     # Sample the requests.
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)

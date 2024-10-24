@@ -266,6 +266,12 @@ class FlashInferMetadata(AttentionMetadata):
     # requests only.
     max_prefill_seq_len: int
 
+    # Number of query tokens for each request in the batch.
+    # Currently, we require that all requests have the same number of query
+    # tokens during the decoding phase. When speculavie decoding is enabled,
+    # decode_query_len might be greater than 1. In all other cases, it is 1.
+    decode_query_len: Optional[int] = 1
+    
     use_cuda_graph: bool = True
 
     prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
@@ -350,11 +356,11 @@ class FlashInferMetadata(AttentionMetadata):
                     self.paged_kv_indices, self.paged_kv_last_page_len,
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
-        else:
+        if self.num_decode_tokens > 0:
             assert self.paged_kv_indices is not None
             assert self.paged_kv_indptr is not None
             assert self.paged_kv_last_page_len is not None
-            self.paged_kv_indices = self.paged_kv_indices.to(self.device)
+            self.paged_kv_indices = self.paged_kv_indices.to(self.device) 
             self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
             self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                 self.device)
@@ -394,21 +400,14 @@ class FlashInferMetadata(AttentionMetadata):
 
     @property
     def prefill_metadata(self) -> Optional["FlashInferMetadata"]:
-        # Currently chunked prefill is not supported
-        if self.num_decode_tokens == 0:
-            assert self.num_prefills > 0
-            return self
-
-        return None
+        if self.num_prefills == 0:
+            return None
+        return self
 
     @property
     def decode_metadata(self) -> Optional["FlashInferMetadata"]:
-        # Currently chunked prefill is not supported
-        if self.num_prefills > 0:
-            assert self.num_decode_tokens == 0, (
-                "Chunked prefill is not supported with flashinfer yet.")
+        if self.num_decode_tokens == 0:
             return None
-
         return self
 
     def advance_step(self,
@@ -519,9 +518,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.num_prefill_tokens += token_len
                 self.prefill_seq_lens.append(seq_len)
             else:
-                assert query_len == 1, (
-                    "seq_len: {}, context_len: {}, query_len: {}".format(
-                        seq_len, context_len, query_len))
                 self.num_decode_tokens += query_len
                 self.curr_seq_lens.append(curr_seq_len)
 
@@ -534,7 +530,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 block_table = computed_block_nums
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
-                block_table = block_tables[seq_id][-curr_sliding_window_block:]
+                if curr_sliding_window_block == 0:
+                    block_table = block_tables[seq_id]
+                else:
+                    block_table = block_tables[seq_id][
+                        -curr_sliding_window_block:]
             self.block_tables.append(block_table)
 
             is_profile_run = is_block_tables_empty(block_tables)
@@ -596,6 +596,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
         num_decode_tokens = self.num_decode_tokens
+        decode_query_lens = query_lens[self.num_prefills:]
+        if len(decode_query_lens) > 0:
+            decode_query_len = max(decode_query_lens)
+        else:
+            decode_query_len = 1
 
         if use_captured_graph:
             self.slot_mapping.extend([PAD_SLOT_ID] * cuda_graph_pad_size)
@@ -686,6 +691,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.runner.kv_cache_dtype, self.runner.model_config.dtype)
 
         return FlashInferMetadata(
+            decode_query_len=decode_query_len,
             num_prefills=self.num_prefills,
             slot_mapping=slot_mapping_tensor,
             num_prefill_tokens=self.num_prefill_tokens,
@@ -808,12 +814,6 @@ def unified_flash_infer(
     key = key.view(-1, num_kv_heads, head_size)
     value = value.view(-1, num_kv_heads, head_size)
 
-    if attn_metadata.num_prefill_tokens > 0:
-        assert attn_metadata.num_decode_tokens == 0, (
-            "Chunked prefill is not supported with flashinfer yet.")
-    if attn_metadata.num_decode_tokens > 0:
-        assert attn_metadata.num_prefill_tokens == 0, (
-            "Chunked prefill is not supported with flashinfer yet.")
     if kv_cache.numel() > 0:
         # Use the same reshape and cache kernel as flash attention.
         ops.reshape_and_cache_flash(
@@ -833,14 +833,34 @@ def unified_flash_infer(
                 kv_cache_dtype)
             kv_cache = kv_cache.view(torch_dtype)
 
-    query = query.contiguous()  # Flashinfer requires query to be contiguous
+    num_prefill_tokens = attn_metadata.num_prefill_tokens
+    num_decode_tokens = attn_metadata.num_decode_tokens
+    assert key.shape[0] == num_prefill_tokens + num_decode_tokens, \
+                f"key : {key.shape} : #prefill tokens {num_prefill_tokens} : #decode tokens {num_decode_tokens}" # noqa
+    assert value.shape[0] == num_prefill_tokens + num_decode_tokens, \
+                f"value : {value.shape} : #prefill toks {num_prefill_tokens} : #decode toks {num_decode_tokens}" # noqa
+    query = query.contiguous(
+    )  # Flashinfer requires query to be contiguous
+    # Query for decode. KV is not needed because it is already cached.
+    # QKV for prefill.
+    decode_query = query[num_prefill_tokens:]
+    query = query[:num_prefill_tokens]
+    
+    key = key[:num_prefill_tokens]
+    value = value[:num_prefill_tokens]
+
+    assert query.shape[0] == num_prefill_tokens
+    assert decode_query.shape[0] == num_decode_tokens
+
+    prefill_output: Optional[torch.Tensor] = None
+    decode_output: Optional[torch.Tensor] = None
     if prefill_meta := attn_metadata.prefill_metadata:
         # We will use flash attention for prefill
         # when kv_cache is not provided.
         # This happens when vllm runs the profiling to
         # determine the number of blocks.
         if kv_cache.numel() == 0:
-            output = flash_attn_varlen_func(
+            prefill_output = flash_attn_varlen_func(
                 q=query,
                 k=key,
                 v=value,
@@ -856,18 +876,43 @@ def unified_flash_infer(
         else:
             assert prefill_meta is not None
             assert prefill_meta.prefill_wrapper is not None
-            output = prefill_meta.prefill_wrapper.forward(
+            prefill_output = prefill_meta.prefill_wrapper.forward(
                 query, kv_cache, logits_soft_cap=logits_soft_cap, causal=True)
-    else:
+    if decode_meta := attn_metadata.decode_metadata:
         assert attn_metadata.decode_metadata is not None
         assert attn_metadata.decode_metadata.decode_wrapper is not None
-        output = attn_metadata.decode_metadata.decode_wrapper.forward(
-            query,
+        # decode_output = attn_metadata.decode_metadata.decode_wrapper.forward(
+        #     decode_query,
+        #     kv_cache,
+        #     sm_scale=softmax_scale,
+        #     logits_soft_cap=logits_soft_cap,
+        #     k_scale=k_scale,
+        #     v_scale=v_scale)
+        # print("decode query:", decode_query.shape)
+        # print("decode query stride:", decode_query.stride())
+        # print("paged_kv_indptr:", prefill_meta.paged_kv_indptr)
+        # print("paged_kv_indices:", prefill_meta.paged_kv_indices)
+        # print("paged_kv_last_page_len:", prefill_meta.paged_kv_last_page_len)
+        decode_output=attn_metadata.decode_metadata.decode_wrapper.forward(
+            decode_query,
             kv_cache,
             sm_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
             k_scale=k_scale,
             v_scale=v_scale)
+    if prefill_output is None:
+        assert decode_output is not None
+        return decode_output.view(num_decode_tokens, hidden_size)
+    if decode_output is None:
+        assert prefill_output is not None
+        return prefill_output.view(num_prefill_tokens, hidden_size)
+
+    # Chunked prefill does not work with speculative decoding.
+    # Therefore, the query length for decode should be 1 in chunked prefill.
+    assert decode_meta is not None
+    assert decode_meta.decode_query_len == 1
+    decode_output = decode_output.squeeze(1)
+    output = torch.cat([prefill_output, decode_output], dim=0)
     return output.view(num_tokens, hidden_size)
 
 
