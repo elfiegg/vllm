@@ -452,8 +452,8 @@ def get_requirements() -> List[str]:
 
 ext_modules = []
 
-if _is_cuda() or _is_hip():
-    ext_modules.append(CMakeExtension(name="vllm._moe_C"))
+# if _is_cuda() or _is_hip():
+#     ext_modules.append(CMakeExtension(name="vllm._moe_C"))
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))

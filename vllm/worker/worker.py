@@ -167,7 +167,10 @@ class Worker(LocalOrDistributedWorkerBase):
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
             gc.collect()
-            torch.cuda.empty_cache()
+            try: 
+                torch.cuda.empty_cache()
+            except RuntimeError: 
+                print("failed at empty cache")
             self.init_gpu_memory = torch.cuda.mem_get_info()[0]
         else:
             raise RuntimeError(

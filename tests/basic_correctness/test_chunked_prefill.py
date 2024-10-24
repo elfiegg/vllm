@@ -23,7 +23,7 @@ MODELS = [
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("dtype", ["half"])
 @pytest.mark.parametrize("max_tokens", [32])
-@pytest.mark.parametrize("chunked_prefill_token_size", [1, 4, 16])
+@pytest.mark.parametrize("chunked_prefill_token_size", [1, 2, 4, 16])
 @pytest.mark.parametrize("enforce_eager", [False, True])
 # NOTE: Increasing this in this suite will fail CI because we currently cannot
 # reset distributed env properly. Use a value > 1 just when you test.
@@ -124,7 +124,7 @@ def test_models_distributed(
 @pytest.mark.parametrize(
     "kv_cache_dtype,model",
     [("fp8_e4m3",
-      "nm-testing/TinyLlama-1.1B-compressed-tensors-kv-cache-scheme")])
+      "meta-llama/Llama-2-7b-hf")])
 # Due to low-precision numerical divergence, we only test logprob of 4 tokens
 @pytest.mark.parametrize("max_tokens", [4])
 @pytest.mark.parametrize("chunked_prefill_token_size", [4, 16])

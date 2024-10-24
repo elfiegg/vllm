@@ -113,6 +113,7 @@ def run_vllm(
         load_format=load_format,
         num_scheduler_steps=num_scheduler_steps,
         disable_async_output_proc=disable_async_output_proc,
+        max_num_seqs=args.max_num_seqs,
     )
 
     # Add the requests to the engine.
@@ -204,6 +205,7 @@ async def run_vllm_async(
         disable_async_output_proc=disable_async_output_proc,
         worker_use_ray=False,
         disable_log_requests=True,
+        max_num_seqs=args.max_num_seqs,
     )
 
     async with build_async_engine_client_from_engine_args(
@@ -314,7 +316,7 @@ def run_mii(
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
-
+    time.sleep(60)
     # Sample the requests.
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
@@ -378,6 +380,10 @@ if __name__ == "__main__":
                         type=str,
                         choices=["vllm", "hf", "mii"],
                         default="vllm")
+    parser.add_argument("--max-num-seqs",
+                        type=int,
+                        default=None,
+                        help="Maximum batch size for HF backend.")
     parser.add_argument("--dataset",
                         type=str,
                         default=None,
